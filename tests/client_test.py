@@ -22,6 +22,91 @@ class FakeAdsClient:
         return {"jobId": "42", "results": []}
 
 
+class FakeResponse:
+    def __init__(self, *, status_code, payload, headers=None):
+        self.status_code = status_code
+        self._payload = payload
+        self.headers = headers or {}
+        self.ok = 200 <= status_code < 300
+
+    def json(self):
+        return self._payload
+
+
+class RestErrorDiagnosticsTest(unittest.TestCase):
+    def test_extracts_google_ads_failure_from_search_stream_array(self):
+        response = FakeResponse(
+            status_code=403,
+            headers={"request-id": "header-request-id"},
+            payload=[
+                {
+                    "error": {
+                        "code": 403,
+                        "message": "The caller does not have permission",
+                        "status": "PERMISSION_DENIED",
+                        "details": [
+                            {
+                                "@type": (
+                                    "type.googleapis.com/google.ads.googleads.v25."
+                                    "errors.GoogleAdsFailure"
+                                ),
+                                "requestId": "body-request-id",
+                                "errors": [
+                                    {
+                                        "errorCode": {
+                                            "authorizationError": (
+                                                "USER_PERMISSION_DENIED"
+                                            )
+                                        },
+                                        "message": (
+                                            "User doesn't have permission to access "
+                                            "customer."
+                                        ),
+                                        "trigger": {
+                                            "stringValue": "must-not-appear-in-log"
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                }
+            ],
+        )
+        session = mock.Mock()
+        session.request.return_value = response
+        credentials = mock.Mock(valid=True, token="token")
+        ads_client = client.GoogleAdsRestClient(
+            developer_token="developer-token",
+            credentials=credentials,
+            session=session,
+        )
+
+        with self.assertRaises(client.GoogleAdsError) as caught:
+            ads_client.request("POST", "/customers/1234567890/googleAds:searchStream")
+
+        message = str(caught.exception)
+        self.assertIn("HTTP 403 (PERMISSION_DENIED)", message)
+        self.assertIn("authorizationError.USER_PERMISSION_DENIED", message)
+        self.assertIn("User doesn't have permission", message)
+        self.assertIn("Request ID: header-request-id", message)
+        self.assertNotIn("must-not-appear-in-log", message)
+
+    def test_uses_request_id_from_failure_body_when_header_is_missing(self):
+        message = client._google_ads_error_message(
+            403,
+            {
+                "error": {
+                    "status": "PERMISSION_DENIED",
+                    "details": [{"requestId": "body-request-id", "errors": []}],
+                }
+            },
+            None,
+        )
+
+        self.assertIn("Request ID: body-request-id", message)
+
+
 class ReportingToolsTest(unittest.TestCase):
     def setUp(self):
         self.fake = FakeAdsClient()
