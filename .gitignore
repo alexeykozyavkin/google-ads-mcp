@@ -37,3 +37,15 @@ coverage.xml
 .hypothesis/
 .pytest_cache/
 .nox/
+
+# Local Python environments
+__pycache__/
+.venv/
+venv/
+
+# Local credentials and OAuth state
+.env
+.env.*
+!.env.example
+oauth-data/
+data/oauth/
