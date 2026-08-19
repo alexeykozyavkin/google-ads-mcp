@@ -23,6 +23,7 @@ class CoordinatorTest(unittest.TestCase):
                 "lookup_gclid",
                 "list_conversion_actions",
                 "upload_offline_conversion",
+                "get_offline_conversion_upload_status",
             },
         )
         write_tools = [

@@ -22,6 +22,18 @@ class FakeAdsClient:
         return {"jobId": "42", "results": []}
 
 
+class FakeDataManagerClient:
+    def __init__(self, login_customer_id="9876543210"):
+        self.login_customer_id = login_customer_id
+        self.requests = []
+
+    def request(self, method, path, json_body=None, params=None):
+        self.requests.append((method, path, json_body, params))
+        if path == "/requestStatus:retrieve":
+            return {"requestStatusPerDestination": [{"requestStatus": "SUCCESS"}]}
+        return {"requestId": "dm-request-42", "fieldWarnings": []}
+
+
 class FakeResponse:
     def __init__(self, *, status_code, payload, headers=None):
         self.status_code = status_code
@@ -106,6 +118,52 @@ class RestErrorDiagnosticsTest(unittest.TestCase):
 
         self.assertIn("Request ID: body-request-id", message)
 
+    def test_data_manager_client_uses_only_oauth_headers(self):
+        response = FakeResponse(
+            status_code=200,
+            payload={"requestId": "dm-request-42"},
+        )
+        session = mock.Mock()
+        session.request.return_value = response
+        credentials = mock.Mock(valid=True, token="token")
+        dm_client = client.DataManagerRestClient(
+            credentials=credentials,
+            login_customer_id="987-654-3210",
+            session=session,
+        )
+
+        dm_client.request("POST", "/events:ingest", json_body={"events": []})
+
+        headers = session.request.call_args.kwargs["headers"]
+        self.assertEqual(headers["Authorization"], "Bearer token")
+        self.assertNotIn("developer-token", headers)
+        self.assertNotIn("login-customer-id", headers)
+
+    def test_data_manager_error_includes_field_violation(self):
+        message = client._data_manager_error_message(
+            400,
+            {
+                "error": {
+                    "status": "INVALID_ARGUMENT",
+                    "message": "Invalid request.",
+                    "details": [
+                        {
+                            "fieldViolations": [
+                                {
+                                    "field": "events[0].eventTimestamp",
+                                    "description": "Timestamp is outside the window.",
+                                }
+                            ]
+                        }
+                    ],
+                }
+            },
+        )
+
+        self.assertIn("HTTP 400 (INVALID_ARGUMENT)", message)
+        self.assertIn("events[0].eventTimestamp", message)
+        self.assertIn("outside the window", message)
+
 
 class ReportingToolsTest(unittest.TestCase):
     def setUp(self):
@@ -177,8 +235,12 @@ class ReportingToolsTest(unittest.TestCase):
 
 class ConversionUploadTest(unittest.TestCase):
     def setUp(self):
-        self.fake = FakeAdsClient()
-        self.patch = mock.patch.object(client, "_client", return_value=self.fake)
+        self.fake = FakeDataManagerClient()
+        self.patch = mock.patch.object(
+            client,
+            "_data_manager_client",
+            return_value=self.fake,
+        )
         self.patch.start()
         self.arguments = {
             "customer_id": "123-456-7890",
@@ -199,17 +261,29 @@ class ConversionUploadTest(unittest.TestCase):
     def test_validation_only_is_default(self):
         result = client.upload_offline_conversion(**self.arguments)
 
-        method, path, payload = self.fake.requests[-1]
-        conversion = payload["conversions"][0]
+        method, path, payload, params = self.fake.requests[-1]
+        destination = payload["destinations"][0]
+        event = payload["events"][0]
         self.assertEqual(method, "POST")
-        self.assertEqual(path, "/customers/1234567890:uploadClickConversions")
+        self.assertEqual(path, "/events:ingest")
+        self.assertIsNone(params)
         self.assertTrue(payload["validateOnly"])
-        self.assertTrue(payload["partialFailure"])
-        self.assertEqual(conversion["gclid"], "CjwK-test")
-        self.assertEqual(conversion["currencyCode"], "USD")
-        self.assertEqual(conversion["orderId"], "CRM-OPP-42")
-        self.assertEqual(conversion["conversionDateTime"], "2026-08-18 15:30:00+07:00")
+        self.assertEqual(
+            destination["operatingAccount"],
+            {"accountType": "GOOGLE_ADS", "accountId": "1234567890"},
+        )
+        self.assertEqual(
+            destination["loginAccount"],
+            {"accountType": "GOOGLE_ADS", "accountId": "9876543210"},
+        )
+        self.assertEqual(destination["productDestinationId"], "987654321")
+        self.assertEqual(event["adIdentifiers"]["gclid"], "CjwK-test")
+        self.assertEqual(event["currency"], "USD")
+        self.assertEqual(event["transactionId"], "CRM-OPP-42")
+        self.assertEqual(event["eventTimestamp"], "2026-08-18T15:30:00+07:00")
+        self.assertEqual(event["eventSource"], "WEB")
         self.assertEqual(result["mode"], "validation_only")
+        self.assertEqual(result["request_id"], "dm-request-42")
 
     def test_real_upload_requires_explicit_confirmation(self):
         with self.assertRaisesRegex(ValueError, "confirm_write=true"):
@@ -223,7 +297,30 @@ class ConversionUploadTest(unittest.TestCase):
             validate_only=False,
             confirm_write=True,
         )
-        self.assertEqual(result["mode"], "uploaded")
+        self.assertEqual(result["mode"], "submitted")
+
+    def test_maps_consent_to_data_manager_enum(self):
+        client.upload_offline_conversion(
+            **self.arguments,
+            ad_user_data_consent="granted",
+        )
+
+        event = self.fake.requests[-1][2]["events"][0]
+        self.assertEqual(
+            event["consent"],
+            {"adUserData": "CONSENT_GRANTED"},
+        )
+
+    def test_rejects_mismatched_conversion_customer(self):
+        mismatched = dict(
+            self.arguments,
+            conversion_action_resource_name=(
+                "customers/9999999999/conversionActions/987654321"
+            ),
+        )
+
+        with self.assertRaisesRegex(ValueError, "must match"):
+            client.upload_offline_conversion(**mismatched)
 
     def test_rejects_negative_value_and_missing_timezone(self):
         negative = dict(self.arguments, conversion_value=-1)
@@ -236,6 +333,16 @@ class ConversionUploadTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "explicit UTC offset"):
             client.upload_offline_conversion(**no_timezone)
+
+    def test_retrieves_async_upload_status(self):
+        result = client.get_offline_conversion_upload_status("dm-request-42")
+
+        method, path, payload, params = self.fake.requests[-1]
+        self.assertEqual(method, "GET")
+        self.assertEqual(path, "/requestStatus:retrieve")
+        self.assertIsNone(payload)
+        self.assertEqual(params, {"requestId": "dm-request-42"})
+        self.assertEqual(result["request_id"], "dm-request-42")
 
 
 if __name__ == "__main__":

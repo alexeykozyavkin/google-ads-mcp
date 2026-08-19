@@ -15,6 +15,7 @@ from google_ads_mcp.client import (
     GoogleAdsError,
     get_campaign_performance,
     get_customer_details,
+    get_offline_conversion_upload_status,
     get_search_terms,
     list_accessible_customers,
     list_linked_accounts,
@@ -193,14 +194,15 @@ mcp_tools = [
     ),
     mcp_types.Tool(
         name="upload_offline_conversion",
-        title="Validate or upload an offline conversion",
+        title="Validate or submit an offline conversion",
         description=(
-            "Validate or upload one CRM conversion using a GCLID, GBRAID, or WBRAID. "
-            "The default validate_only=true performs no write. Before a real upload, "
-            "first validate the identical payload, then explicitly set "
-            "validate_only=false and confirm_write=true. order_id must be a stable "
-            "unique CRM identifier. Do not represent bad leads as negative values; "
-            "upload qualified stages as separate actions or use adjustments."
+            "Validate or submit one CRM conversion through the Google Data Manager "
+            "API using a GCLID, GBRAID, or WBRAID. The default validate_only=true "
+            "performs no write. Before a real submission, first validate the identical "
+            "payload, then explicitly set validate_only=false and confirm_write=true. "
+            "A real submission is asynchronous; use its request_id with "
+            "get_offline_conversion_upload_status. order_id must be a stable unique "
+            "CRM identifier."
         ),
         inputSchema={
             "type": "object",
@@ -246,6 +248,28 @@ mcp_tools = [
         },
         annotations=_WRITE,
     ),
+    mcp_types.Tool(
+        name="get_offline_conversion_upload_status",
+        title="Get offline conversion upload status",
+        description=(
+            "Retrieve asynchronous Data Manager diagnostics for a request_id returned "
+            "by a successful non-validation offline conversion submission. A request "
+            "may remain PROCESSING while Google finishes ingestion. Read-only."
+        ),
+        inputSchema={
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["request_id"],
+            "properties": {
+                "request_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512,
+                }
+            },
+        },
+        annotations=_READ_ONLY,
+    ),
 ]
 
 _TOOL_MAP: dict[str, Callable[..., dict[str, Any]]] = {
@@ -257,6 +281,7 @@ _TOOL_MAP: dict[str, Callable[..., dict[str, Any]]] = {
     "lookup_gclid": lookup_gclid,
     "list_conversion_actions": list_conversion_actions,
     "upload_offline_conversion": upload_offline_conversion,
+    "get_offline_conversion_upload_status": get_offline_conversion_upload_status,
 }
 
 
