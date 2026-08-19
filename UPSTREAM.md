@@ -15,6 +15,10 @@ git fetch upstream
 git merge upstream/main
 ```
 
+## Local deployment
+
+- [Railway read-only POC](docs/RAILWAY_POC.md)
+
 ## Local direction
 
 The initial code remains read-only. Planned local extensions should be deliberately narrow:
