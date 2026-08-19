@@ -30,6 +30,89 @@ class GoogleAdsError(RuntimeError):
     """A sanitized Google Ads API failure."""
 
 
+def _error_envelopes(payload: Any) -> list[dict[str, Any]]:
+    """Return REST error envelopes from regular and searchStream responses."""
+
+    if isinstance(payload, dict):
+        return [payload]
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    return []
+
+
+def _error_code_label(error_code: Any) -> str | None:
+    """Render a GoogleAdsFailure errorCode without exposing trigger values."""
+
+    if not isinstance(error_code, dict):
+        return None
+    for category, value in error_code.items():
+        if isinstance(value, str) and value:
+            return f"{category}.{value}"
+        if isinstance(value, dict):
+            nested = _error_code_label(value)
+            if nested:
+                return f"{category}.{nested}"
+    return None
+
+
+def _google_ads_error_message(
+    status_code: int,
+    payload: Any,
+    header_request_id: str | None,
+) -> str:
+    """Build a bounded, sanitized diagnostic from a Google Ads REST failure."""
+
+    status: str | None = None
+    top_message: str | None = None
+    request_id = header_request_id
+    failures: list[str] = []
+
+    for envelope in _error_envelopes(payload):
+        error = envelope.get("error")
+        if not isinstance(error, dict):
+            continue
+        if not status and isinstance(error.get("status"), str):
+            status = error["status"]
+        if not top_message and isinstance(error.get("message"), str):
+            top_message = error["message"]
+
+        details = error.get("details")
+        if not isinstance(details, list):
+            continue
+        for detail in details:
+            if not isinstance(detail, dict):
+                continue
+            if not request_id and isinstance(detail.get("requestId"), str):
+                request_id = detail["requestId"]
+            errors = detail.get("errors")
+            if not isinstance(errors, list):
+                continue
+            for failure in errors:
+                if not isinstance(failure, dict):
+                    continue
+                label = _error_code_label(failure.get("errorCode"))
+                detail_message = failure.get("message")
+                rendered = label or "GoogleAdsFailure"
+                if isinstance(detail_message, str) and detail_message:
+                    rendered = f"{rendered}: {detail_message}"
+                if rendered not in failures:
+                    failures.append(rendered)
+                if len(failures) >= 4:
+                    break
+
+    message = f"Google Ads API returned HTTP {status_code}"
+    if status:
+        message += f" ({status})"
+    message += "."
+    if top_message:
+        message += f" {top_message}"
+    if failures:
+        message += " " + " | ".join(failures)
+    if request_id:
+        message += f" Request ID: {request_id}."
+    return message
+
+
 def _normalize_customer_id(value: str, *, field: str = "customer_id") -> str:
     normalized = value.replace("-", "").replace(" ", "").strip()
     if not _CUSTOMER_ID_RE.fullmatch(normalized):
@@ -159,16 +242,12 @@ class GoogleAdsRestClient:
         if response.ok:
             return payload
 
-        message = f"Google Ads API returned HTTP {response.status_code}."
         request_id = response.headers.get("request-id")
-        if isinstance(payload, dict):
-            error = payload.get("error")
-            if isinstance(error, dict) and error.get("message"):
-                message = str(error["message"])
-            elif payload.get("message"):
-                message = str(payload["message"])
-        if request_id:
-            message = f"{message} Request ID: {request_id}."
+        message = _google_ads_error_message(
+            response.status_code,
+            payload,
+            request_id,
+        )
         raise GoogleAdsError(message)
 
     def search(self, customer_id: str, query: str) -> list[dict[str, Any]]:
