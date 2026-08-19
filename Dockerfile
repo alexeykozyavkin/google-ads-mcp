@@ -1,22 +1,22 @@
-# Use a slim Python image
-FROM python:3.11-slim
+FROM python:3.12-slim
 
-# Install uv
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
 
-# Set the working directory in the container
 WORKDIR /app
 
-# Copy the project files into the container
-COPY . .
+RUN useradd --create-home --uid 10001 appuser
 
-# Install the project and its dependencies
-# We use --system to install into the system Python environment in the container
-RUN uv pip install --system .
+COPY pyproject.toml README.md ./
+COPY google_ads_mcp ./google_ads_mcp
 
-# Expose port 8080 (default for Cloud Run)
+RUN python -m pip install --upgrade pip \
+    && python -m pip install .
+
+USER appuser
+
 EXPOSE 8080
 
-# Define the command to run the server
-# This uses the entry point defined in pyproject.toml
-CMD ["google-ads-mcp"]
+CMD ["python", "-m", "google_ads_mcp.remote_server"]
+
