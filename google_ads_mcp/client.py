@@ -13,6 +13,7 @@ from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2 import service_account
 
 _ADS_SCOPE = "https://www.googleapis.com/auth/adwords"
+_DATA_MANAGER_SCOPE = "https://www.googleapis.com/auth/datamanager"
 _DEFAULT_API_VERSION = "v25"
 _CUSTOMER_ID_RE = re.compile(r"^\d{10}$")
 _API_VERSION_RE = re.compile(r"^v\d+$")
@@ -113,6 +114,60 @@ def _google_ads_error_message(
     return message
 
 
+def _data_manager_error_message(status_code: int, payload: Any) -> str:
+    """Build a bounded diagnostic from a Data Manager REST failure."""
+
+    status: str | None = None
+    top_message: str | None = None
+    details: list[str] = []
+
+    for envelope in _error_envelopes(payload):
+        error = envelope.get("error")
+        if not isinstance(error, dict):
+            continue
+        if not status and isinstance(error.get("status"), str):
+            status = error["status"]
+        if not top_message and isinstance(error.get("message"), str):
+            top_message = error["message"]
+
+        raw_details = error.get("details")
+        if not isinstance(raw_details, list):
+            continue
+        for detail in raw_details:
+            if not isinstance(detail, dict):
+                continue
+            reason = detail.get("reason")
+            if isinstance(reason, str) and reason and reason not in details:
+                details.append(reason)
+            violations = detail.get("fieldViolations")
+            if not isinstance(violations, list):
+                continue
+            for violation in violations:
+                if not isinstance(violation, dict):
+                    continue
+                field = violation.get("field")
+                description = violation.get("description")
+                rendered = "Field violation"
+                if isinstance(field, str) and field:
+                    rendered += f" at {field}"
+                if isinstance(description, str) and description:
+                    rendered += f": {description}"
+                if rendered not in details:
+                    details.append(rendered)
+                if len(details) >= 4:
+                    break
+
+    message = f"Data Manager API returned HTTP {status_code}"
+    if status:
+        message += f" ({status})"
+    message += "."
+    if top_message:
+        message += f" {top_message}"
+    if details:
+        message += " " + " | ".join(details[:4])
+    return message
+
+
 def _normalize_customer_id(value: str, *, field: str = "customer_id") -> str:
     normalized = value.replace("-", "").replace(" ", "").strip()
     if not _CUSTOMER_ID_RE.fullmatch(normalized):
@@ -135,7 +190,9 @@ def _validate_date_range(start_date: str, end_date: str) -> tuple[str, str]:
     return start, end
 
 
-def _normalize_datetime(value: str, *, field: str) -> str:
+def _normalize_rfc3339_datetime(value: str, *, field: str) -> str:
+    """Normalize an offset-aware timestamp for the Data Manager API."""
+
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except (TypeError, ValueError) as exc:
@@ -144,8 +201,8 @@ def _normalize_datetime(value: str, *, field: str) -> str:
         ) from exc
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise ValueError(f"{field} must include an explicit UTC offset.")
-    rendered = parsed.strftime("%Y-%m-%d %H:%M:%S%z")
-    return f"{rendered[:-2]}:{rendered[-2:]}"
+    rendered = parsed.isoformat(timespec="seconds")
+    return rendered.replace("+00:00", "Z")
 
 
 def _validate_limit(value: int, *, maximum: int = 1000) -> int:
@@ -265,9 +322,87 @@ class GoogleAdsRestClient:
         return rows
 
 
+class DataManagerRestClient:
+    """Small Data Manager REST wrapper using the same service-account key."""
+
+    def __init__(
+        self,
+        *,
+        credentials: Any,
+        login_customer_id: str | None = None,
+        session: requests.Session | None = None,
+    ):
+        self.credentials = credentials
+        self.login_customer_id = (
+            _normalize_customer_id(login_customer_id, field="login_customer_id")
+            if login_customer_id
+            else None
+        )
+        self.session = session or requests.Session()
+        self.base_url = "https://datamanager.googleapis.com/v1"
+
+    @classmethod
+    def from_environment(cls) -> "DataManagerRestClient":
+        credentials_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+        if not credentials_path:
+            raise RuntimeError(
+                "Set GOOGLE_APPLICATION_CREDENTIALS to the materialized service-account JSON."
+            )
+        credentials = service_account.Credentials.from_service_account_file(
+            credentials_path,
+            scopes=[_DATA_MANAGER_SCOPE],
+        )
+        return cls(
+            credentials=credentials,
+            login_customer_id=os.environ.get("GOOGLE_ADS_LOGIN_CUSTOMER_ID") or None,
+        )
+
+    def _headers(self) -> dict[str, str]:
+        if not getattr(self.credentials, "valid", False):
+            self.credentials.refresh(GoogleAuthRequest())
+        return {
+            "Authorization": f"Bearer {self.credentials.token}",
+            "Content-Type": "application/json",
+        }
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json_body: dict[str, Any] | None = None,
+        params: dict[str, str] | None = None,
+    ) -> Any:
+        try:
+            response = self.session.request(
+                method,
+                f"{self.base_url}{path}",
+                headers=self._headers(),
+                json=json_body,
+                params=params,
+                timeout=60,
+            )
+        except requests.RequestException as exc:
+            raise GoogleAdsError("Data Manager API request failed to connect.") from exc
+
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = None
+        if response.ok:
+            return payload
+
+        raise GoogleAdsError(_data_manager_error_message(response.status_code, payload))
+
+
 @lru_cache(maxsize=1)
 def _client() -> GoogleAdsRestClient:
     return GoogleAdsRestClient.from_environment()
+
+
+@lru_cache(maxsize=1)
+def _data_manager_client() -> DataManagerRestClient:
+    return DataManagerRestClient.from_environment()
 
 
 def list_accessible_customers() -> dict[str, Any]:
@@ -506,7 +641,7 @@ def upload_offline_conversion(
     confirm_write: bool = False,
     ad_user_data_consent: str | None = None,
 ) -> dict[str, Any]:
-    """Validate or upload one CRM/offline conversion with explicit safeguards."""
+    """Validate or ingest one CRM conversion through the Data Manager API."""
 
     customer = _normalize_customer_id(customer_id)
     match = _CONVERSION_ACTION_RE.fullmatch(conversion_action_resource_name.strip())
@@ -514,6 +649,11 @@ def upload_offline_conversion(
         raise ValueError(
             "conversion_action_resource_name must look like "
             "customers/1234567890/conversionActions/123."
+        )
+    action_customer = match.group("customer")
+    if action_customer != customer:
+        raise ValueError(
+            "customer_id must match the customer in conversion_action_resource_name."
         )
     if not isinstance(click_id, str) or not click_id.strip() or len(click_id) > 512:
         raise ValueError(
@@ -542,17 +682,16 @@ def upload_offline_conversion(
             "a real conversion upload. Run validate_only=true first."
         )
 
-    conversion: dict[str, Any] = {
-        _CLICK_ID_FIELDS[click_type]: click_id.strip(),
-        "conversionAction": conversion_action_resource_name.strip(),
-        "conversionDateTime": _normalize_datetime(
+    event: dict[str, Any] = {
+        "adIdentifiers": {_CLICK_ID_FIELDS[click_type]: click_id.strip()},
+        "eventTimestamp": _normalize_rfc3339_datetime(
             conversion_date_time,
             field="conversion_date_time",
         ),
         "conversionValue": float(conversion_value),
-        "currencyCode": currency,
-        "orderId": order_id.strip(),
-        "conversionEnvironment": "WEB",
+        "currency": currency,
+        "transactionId": order_id.strip(),
+        "eventSource": "WEB",
     }
     if ad_user_data_consent:
         consent = ad_user_data_consent.upper().strip()
@@ -560,20 +699,71 @@ def upload_offline_conversion(
             raise ValueError(
                 "ad_user_data_consent must be GRANTED, DENIED, or UNSPECIFIED."
             )
-        conversion["consent"] = {"adUserData": consent}
+        consent_values = {
+            "GRANTED": "CONSENT_GRANTED",
+            "DENIED": "CONSENT_DENIED",
+            "UNSPECIFIED": "CONSENT_STATUS_UNSPECIFIED",
+        }
+        event["consent"] = {"adUserData": consent_values[consent]}
 
-    payload = _client().request(
+    data_manager = _data_manager_client()
+    destination: dict[str, Any] = {
+        "operatingAccount": {
+            "accountType": "GOOGLE_ADS",
+            "accountId": customer,
+        },
+        "productDestinationId": match.group("action"),
+    }
+    if data_manager.login_customer_id:
+        destination["loginAccount"] = {
+            "accountType": "GOOGLE_ADS",
+            "accountId": data_manager.login_customer_id,
+        }
+
+    payload = data_manager.request(
         "POST",
-        f"/customers/{customer}:uploadClickConversions",
+        "/events:ingest",
         json_body={
-            "conversions": [conversion],
-            "partialFailure": True,
+            "destinations": [destination],
+            "events": [event],
             "validateOnly": bool(validate_only),
         },
     )
+    request_id = payload.get("requestId") if isinstance(payload, dict) else None
     return {
         "customer_id": customer,
-        "mode": "validation_only" if validate_only else "uploaded",
+        "mode": "validation_only" if validate_only else "submitted",
         "order_id": order_id.strip(),
+        "request_id": request_id,
         "response": payload,
+        "note": (
+            "Validation only: no conversion was written. Repeat the identical payload "
+            "with validate_only=false and confirm_write=true after validation succeeds."
+            if validate_only
+            else "Accepted asynchronously. Check request_id with "
+            "get_offline_conversion_upload_status before treating the upload as complete."
+        ),
+    }
+
+
+def get_offline_conversion_upload_status(request_id: str) -> dict[str, Any]:
+    """Retrieve asynchronous Data Manager diagnostics for a real upload."""
+
+    if not isinstance(request_id, str) or not request_id.strip():
+        raise ValueError("request_id must be a non-empty string.")
+    normalized = request_id.strip()
+    if len(normalized) > 512:
+        raise ValueError("request_id must be at most 512 characters.")
+    payload = _data_manager_client().request(
+        "GET",
+        "/requestStatus:retrieve",
+        params={"requestId": normalized},
+    )
+    return {
+        "request_id": normalized,
+        "response": payload,
+        "note": (
+            "Diagnostics are available only for successful non-validation requests "
+            "and can remain PROCESSING while Google finishes ingestion."
+        ),
     }
